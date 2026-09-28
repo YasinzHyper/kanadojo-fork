@@ -1,0 +1,111 @@
+name: Upstream relay
+
+# Posts comments and opens pull requests on lingdojo/kana-dojo on behalf of the
+# fork owner. Triggered from a branch push workflow in this fork; the token is
+# the UPSTREAM_TOKEN repository secret (classic token, public_repo scope).
+
+on:
+  repository_dispatch:
+    types: [claim-issue, comment, release-issue, open-pr]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'claim-issue | comment | release-issue | open-pr'
+        required: true
+        type: string
+      issue:
+        description: 'Upstream issue number'
+        required: false
+        type: string
+      body:
+        description: 'Comment text or pull request body'
+        required: false
+        type: string
+      title:
+        description: 'Pull request title'
+        required: false
+        type: string
+      branch:
+        description: 'Branch in this fork to open the pull request from'
+        required: false
+        type: string
+      draft:
+        description: 'Open the pull request as a draft (true/false)'
+        required: false
+        type: string
+        default: 'false'
+
+permissions: {}
+
+concurrency:
+  group: upstream-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          DISPATCH_ACTION: ${{ github.event.action }}
+          DISPATCH_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          MANUAL_INPUTS: ${{ toJson(inputs) }}
+        with:
+          github-token: ${{ secrets.UPSTREAM_TOKEN }}
+          script: |
+            const owner = 'lingdojo';
+            const repo = 'kana-dojo';
+            const forkOwner = context.repo.owner;
+            const isDispatch = context.eventName === 'repository_dispatch';
+            const raw = isDispatch ? process.env.DISPATCH_PAYLOAD : process.env.MANUAL_INPUTS;
+            const p = (raw && raw !== 'null') ? JSON.parse(raw) : {};
+            const action = isDispatch ? process.env.DISPATCH_ACTION : p.action;
+            const issue = p.issue ? Number(p.issue) : null;
+            const body = p.body || '';
+            const draft = p.draft === true || p.draft === 'true';
+            core.info(`action=${action} issue=${issue || ''} branch=${p.branch || ''}`);
+
+            switch (action) {
+              case 'claim-issue': {
+                if (!issue) throw new Error('issue is required');
+                const r = await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue,
+                  body: body || "I'd like to take this one.",
+                });
+                core.info(`comment: ${r.data.html_url}`);
+                break;
+              }
+              case 'comment': {
+                if (!issue || !body) throw new Error('issue and body are required');
+                const r = await github.rest.issues.createComment({ owner, repo, issue_number: issue, body });
+                core.info(`comment: ${r.data.html_url}`);
+                break;
+              }
+              case 'release-issue': {
+                if (!issue) throw new Error('issue is required');
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue,
+                  body: body || 'Releasing this one, I could not get to it after all.',
+                });
+                await github.rest.issues
+                  .removeAssignees({ owner, repo, issue_number: issue, assignees: [forkOwner] })
+                  .catch((e) => core.warning(e.message));
+                break;
+              }
+              case 'open-pr': {
+                if (!p.branch || !p.title) throw new Error('branch and title are required');
+                const r = await github.rest.pulls.create({
+                  owner, repo,
+                  title: p.title,
+                  head: `${forkOwner}:${p.branch}`,
+                  base: 'main',
+                  body,
+                  draft,
+                });
+                core.info(`pull request: ${r.data.html_url}`);
+                break;
+              }
+              default:
+                throw new Error(`unknown action: ${action}`);
+            }
